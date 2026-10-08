@@ -1,4 +1,262 @@
 // 自動生成ファイル（npm run bundle）。src/*.gs を編集すること。
+// 初期設定: 上部のプルダウンで「setup」を選んで ▷実行
+// ===== Setup.gs =====
+/**
+ * 初期設定（スクリプトエディタから手動実行）。
+ *
+ * 事前準備:
+ *   1. テンプレートExcel（SVレポート_2026.10ver.xls）を Drive にアップロードし、ファイルIDを
+ *      スクリプトプロパティ TEMPLATE_XLS_FILE_ID に設定する。
+ *   2. （任意）ROOT_FOLDER_ID / NOTIFY_TO を設定する。ROOT_FOLDER_ID 未設定時は既定のフォルダ。
+ *
+ * setup() が行うこと（何度実行しても安全）:
+ *   - 保存先フォルダに「_システム」フォルダを作成
+ *   - テンプレートを Google スプレッドシートに変換（TEMPLATE_SPREADSHEET_ID）
+ *   - 管理用スプレッドシートを作成し各シートを用意（DB_SPREADSHEET_ID）
+ *   - テンプレートから校舎マスタ・項目マスタを作成（未作成の場合のみ）
+ */
+function setup() {
+  var p = props_();
+  var rootId = p.getProperty('ROOT_FOLDER_ID') || DEFAULT_ROOT_FOLDER_ID;
+  p.setProperty('ROOT_FOLDER_ID', rootId);
+  var sys = systemFolder_();
+
+  var templateId = p.getProperty('TEMPLATE_SPREADSHEET_ID');
+  if (!templateId) {
+    var xlsId = p.getProperty('TEMPLATE_XLS_FILE_ID');
+    if (!xlsId) {
+      throw new Error('スクリプトプロパティ TEMPLATE_XLS_FILE_ID に、Drive にアップロードしたテンプレート（.xls）のファイルIDを設定してください。');
+    }
+    templateId = convertToSpreadsheet_(xlsId, 'SVレポート_テンプレート', sys.getId());
+    p.setProperty('TEMPLATE_SPREADSHEET_ID', templateId);
+  }
+
+  var dbId = p.getProperty('DB_SPREADSHEET_ID');
+  var ss;
+  if (dbId) {
+    ss = SpreadsheetApp.openById(dbId);
+  } else {
+    ss = SpreadsheetApp.create('SVレポート_管理DB');
+    DriveApp.getFileById(ss.getId()).moveTo(sys);
+    p.setProperty('DB_SPREADSHEET_ID', ss.getId());
+  }
+  Object.keys(SHEETS).forEach(function (key) { ensureSheet_(ss, key); });
+  ss.getSheets().forEach(function (sh) {
+    var known = Object.keys(SHEETS).some(function (k) { return SHEETS[k] === sh.getName(); });
+    if (!known && sh.getLastRow() === 0 && ss.getSheets().length > 1) ss.deleteSheet(sh);
+  });
+  db_cache_ = ss;
+
+  importMastersFromTemplate_(templateId);
+  Logger.log('セットアップ完了\n管理DB: %s\nテンプレート: %s', ss.getUrl(), SpreadsheetApp.openById(templateId).getUrl());
+}
+
+/**
+ * テンプレートの改版時に実行する。
+ * TEMPLATE_XLS_FILE_ID を新しいExcelのIDに変更してから実行すると、テンプレートを差し替え、
+ * 新しい版の項目を項目マスタに追加して現行版を切り替える。
+ * 注意: 項目キーは No から自動採番する。改版で No がずれた場合は、前回・前々回と正しく
+ * 紐付くよう、項目マスタの新しい版の「項目キー」を旧版に合わせて修正すること。
+ */
+function updateTemplate() {
+  var p = props_();
+  var xlsId = p.getProperty('TEMPLATE_XLS_FILE_ID');
+  if (!xlsId) throw new Error('TEMPLATE_XLS_FILE_ID を設定してください');
+  var templateId = convertToSpreadsheet_(xlsId, 'SVレポート_テンプレート_' + formatDate_(new Date(), 'yyyyMMdd'), systemFolder_().getId());
+  p.setProperty('TEMPLATE_SPREADSHEET_ID', templateId);
+  importMastersFromTemplate_(templateId);
+}
+
+function systemFolder_() {
+  var root = DriveApp.getFolderById(props_().getProperty('ROOT_FOLDER_ID') || DEFAULT_ROOT_FOLDER_ID);
+  return getOrCreateFolder_(root, '_システム');
+}
+
+/** Excel を Google スプレッドシートに変換（既にスプレッドシートならコピー）して新しいファイルIDを返す */
+function convertToSpreadsheet_(fileId, name, parentId) {
+  var src = DriveApp.getFileById(fileId);
+  if (src.getMimeType() === MimeType.GOOGLE_SHEETS) {
+    return src.makeCopy(name, DriveApp.getFolderById(parentId)).getId();
+  }
+  var copied = Drive.Files.copy(
+    { name: name, mimeType: MimeType.GOOGLE_SHEETS, parents: [parentId] },
+    fileId,
+    { supportsAllDrives: true }
+  );
+  return copied.id;
+}
+
+function importMastersFromTemplate_(templateId) {
+  var tpl = SpreadsheetApp.openById(templateId);
+  var sh = tpl.getSheetByName(REPORT_SHEET_NAME) || tpl.getSheets()[0];
+  var values = sh.getRange(1, 1, sh.getLastRow(), 15).getValues();
+  var version = parseVersion(values);
+  if (!version) throw new Error('テンプレートのO1セルから版を読み取れません');
+
+  // 項目マスタ（その版が未登録の場合のみ追加）
+  var exists = readObjects_('items').some(function (r) { return String(r['版']) === version; });
+  if (!exists) {
+    appendObjects_('items', parseTemplateItems(values).map(function (i) {
+      return {
+        '版': version, '項目キー': i.key, 'No': String(i.no), '種別': i.type, '区分': i.category, '項目': i.text,
+        '減点L': i.penalties.L === null ? '' : i.penalties.L,
+        '減点M': i.penalties.M === null ? '' : i.penalties.M,
+        '減点H': i.penalties.H === null ? '' : i.penalties.H,
+        '出力行': i.row, '対象外業態': guessExcludedBusinesses(i.text).join(','), '有効': true
+      };
+    }));
+  }
+  props_().setProperty('CURRENT_ITEM_VERSION', version);
+
+  // 校舎マスタ（空の場合のみテンプレートの校舎一覧から作成）
+  var schoolSheet = tpl.getSheetByName(SCHOOL_LIST_SHEET_NAME);
+  if (schoolSheet && readObjects_('schools').length === 0) {
+    var list = parseSchoolList(schoolSheet.getDataRange().getValues());
+    appendObjects_('schools', list.map(function (s) {
+      return {
+        '校舎ID': s.id, '業態': s.business, '地域': s.region, '校舎名': s.name, '経営': s.management,
+        '会社': s.company, '開校日': s.openDate, '備考': s.remarks, '有効': true
+      };
+    }));
+  }
+}
+
+// ===== Import.gs =====
+/**
+ * 過去データの取込（スクリプトエディタから手動実行）。
+ *
+ * スクリプトプロパティ IMPORT_FOLDER_ID のフォルダ（サブフォルダ含む）にある過去のSVレポート
+ * （.xls / .xlsx / Google スプレッドシート）を読み取り、登録履歴・明細に「取込」として登録する。
+ * - 校舎ID（E2）と実施日（G2）から年度・実施回を判定。同じ実施回が登録済みならスキップ
+ * - 項目は項目文で現行の項目マスタと照合（版が違っても文言が同じなら紐付く）
+ * - L列（今回の適用減点）と K列（連続指摘回数）をそのまま取り込む
+ * - 実行時間の上限（6分）に近づいたら中断する。未処理が残った場合は再実行すると続きから処理する
+ * 結果は管理DBの「取込ログ」シートに記録される。
+ */
+function importPastReports() {
+  var folderId = props_().getProperty('IMPORT_FOLDER_ID');
+  if (!folderId) throw new Error('スクリプトプロパティ IMPORT_FOLDER_ID に取込元フォルダのIDを設定してください');
+  var started = Date.now();
+  var done = processedImportFileIds_();
+  var master = getItems_();
+  var schools = {};
+  readObjects_('schools').forEach(function (r) {
+    schools[String(r['校舎ID'])] = { id: String(r['校舎ID']), name: String(r['校舎名']), business: String(r['業態']) };
+  });
+  var workFolder = getOrCreateFolder_(systemFolder_(), '_取込作業');
+  var count = { ok: 0, skip: 0, error: 0, remaining: 0 };
+
+  listSpreadsheetFiles_(DriveApp.getFolderById(folderId)).forEach(function (file) {
+    if (done[file.getId()]) return;
+    if (Date.now() - started > 4.5 * 60 * 1000) {
+      count.remaining++;
+      return;
+    }
+    try {
+      var res = importOne_(file, master, schools, workFolder);
+      logImport_(file.getId(), file.getName(), res.status, res.reportId, res.message);
+      count[res.status === 'OK' ? 'ok' : 'skip']++;
+    } catch (e) {
+      logImport_(file.getId(), file.getName(), 'エラー', '', e.message);
+      count.error++;
+    }
+  });
+  Logger.log('取込: 成功 %s / スキップ %s / エラー %s / 未処理 %s', count.ok, count.skip, count.error, count.remaining);
+  if (count.remaining) Logger.log('未処理のファイルがあります。importPastReports() を再実行してください。');
+}
+
+var IMPORTABLE_MIME_TYPES = [
+  'application/vnd.google-apps.spreadsheet',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+];
+
+function listSpreadsheetFiles_(folder) {
+  var result = [];
+  var files = folder.getFiles();
+  while (files.hasNext()) {
+    var f = files.next();
+    if (IMPORTABLE_MIME_TYPES.indexOf(f.getMimeType()) >= 0) result.push(f);
+  }
+  var subs = folder.getFolders();
+  while (subs.hasNext()) result = result.concat(listSpreadsheetFiles_(subs.next()));
+  return result;
+}
+
+function toDateString_(v) {
+  if (v instanceof Date) return formatDate_(v);
+  var m = /(\d{4})[\/\-.年](\d{1,2})[\/\-.月](\d{1,2})/.exec(String(v || ''));
+  return m ? m[1] + '-' + ('0' + m[2]).slice(-2) + '-' + ('0' + m[3]).slice(-2) : '';
+}
+
+function importOne_(file, master, schools, workFolder) {
+  var tempId = null;
+  var ssId = file.getId();
+  if (file.getMimeType() !== MimeType.GOOGLE_SHEETS) {
+    tempId = convertToSpreadsheet_(file.getId(), '取込_' + file.getName(), workFolder.getId());
+    ssId = tempId;
+  }
+  try {
+    var ss = SpreadsheetApp.openById(ssId);
+    var sh = ss.getSheetByName(REPORT_SHEET_NAME) || ss.getSheets()[0];
+    var parsed = parseReportSheet(sh.getRange(1, 1, sh.getLastRow(), 15).getValues());
+    var h = parsed.header;
+    if (!h.schoolId) throw new Error('校舎ID（E2）が空です');
+    var dateStr = toDateString_(h.date);
+    if (!dateStr) throw new Error('実施日（G2）が読み取れません');
+
+    var period = periodOf(dateStr);
+    var school = schools[h.schoolId] || { id: h.schoolId, name: h.schoolName, business: h.business };
+    var reportId = reportIdOf(period.year, period.round, school.id);
+    if (findReport_(reportId)) return { status: 'スキップ', reportId: reportId, message: '登録済み' };
+
+    // 項目の照合（全文一致 → 先頭一致）
+    var byText = {};
+    master.items.forEach(function (i) { byText[normalizeItemText(i.text)] = i; });
+    var mapped = {};
+    var unmatched = [];
+    parsed.items.forEach(function (pi) {
+      var norm = normalizeItemText(pi.text);
+      var mi = byText[norm] || master.items.filter(function (i) {
+        var n = normalizeItemText(i.text);
+        return n.indexOf(norm.slice(0, 12)) === 0 || norm.indexOf(n.slice(0, 12)) === 0;
+      })[0];
+      if (!mi || mapped[mi.key]) {
+        if (pi.applied < 0) unmatched.push('No.' + pi.no + '(' + pi.applied + ')');
+        return;
+      }
+      mapped[mi.key] = {
+        level: inferLevel(pi, pi.applied, pi.count),
+        base: pi.applied < 0 ? pi.applied / Math.min(pi.count || 1, MAX_MULTIPLIER) : 0,
+        count: pi.count, applied: pi.applied, na: /^対象外/.test(pi.note), note: pi.note
+      };
+    });
+
+    var total = parsed.items.reduce(function (s, pi) { return s + (pi.applied < 0 ? pi.applied : 0); }, 0);
+    var now = new Date();
+    saveReport_({
+      'レポートID': reportId, '年度': period.year, '実施回': period.round, '校舎ID': school.id,
+      '校舎名': school.name, '業態': school.business, '実施日': dateStr, 'AM': h.am, 'SV': h.sv,
+      '現金': h.cash, '通帳残': h.bank, 'TMS金額': h.tms, '減点合計': total, '点数': 100 + total,
+      'テンプレート版': h.version, 'ファイルID': file.getId(), 'ファイルURL': file.getUrl(), '版数': 1,
+      '登録者': currentUserEmail_(), '登録日時': now, '更新日時': now, '区分': '取込', '送信ID': ''
+    }, master.items.map(function (i) {
+      var l = mapped[i.key] || { level: '', base: 0, count: 0, applied: 0, na: false, note: '' };
+      return {
+        'レポートID': reportId, '校舎ID': school.id, '年度': period.year, '実施回': period.round,
+        '項目キー': i.key, 'レベル': l.level, '基本減点': l.base, '連続回数': l.count,
+        '適用減点': l.applied, '対象外': l.na, '備考': l.note
+      };
+    }));
+    return {
+      status: 'OK', reportId: reportId,
+      message: unmatched.length ? '項目マスタと照合できない減点あり（合計点には含む）: ' + unmatched.join(' ') : ''
+    };
+  } finally {
+    if (tempId) DriveApp.getFileById(tempId).setTrashed(true);
+  }
+}
+
 // ===== Config.gs =====
 /**
  * 設定。値はスクリプトプロパティに保存する（setup() が自動設定）。
@@ -954,261 +1212,4 @@ function validatePayload_(p) {
     }
   });
   if (errors.length) throw new Error('未入力または不正な項目があります: ' + errors.join('、'));
-}
-
-// ===== Setup.gs =====
-/**
- * 初期設定（スクリプトエディタから手動実行）。
- *
- * 事前準備:
- *   1. テンプレートExcel（SVレポート_2026.10ver.xls）を Drive にアップロードし、ファイルIDを
- *      スクリプトプロパティ TEMPLATE_XLS_FILE_ID に設定する。
- *   2. （任意）ROOT_FOLDER_ID / NOTIFY_TO を設定する。ROOT_FOLDER_ID 未設定時は既定のフォルダ。
- *
- * setup() が行うこと（何度実行しても安全）:
- *   - 保存先フォルダに「_システム」フォルダを作成
- *   - テンプレートを Google スプレッドシートに変換（TEMPLATE_SPREADSHEET_ID）
- *   - 管理用スプレッドシートを作成し各シートを用意（DB_SPREADSHEET_ID）
- *   - テンプレートから校舎マスタ・項目マスタを作成（未作成の場合のみ）
- */
-function setup() {
-  var p = props_();
-  var rootId = p.getProperty('ROOT_FOLDER_ID') || DEFAULT_ROOT_FOLDER_ID;
-  p.setProperty('ROOT_FOLDER_ID', rootId);
-  var sys = systemFolder_();
-
-  var templateId = p.getProperty('TEMPLATE_SPREADSHEET_ID');
-  if (!templateId) {
-    var xlsId = p.getProperty('TEMPLATE_XLS_FILE_ID');
-    if (!xlsId) {
-      throw new Error('スクリプトプロパティ TEMPLATE_XLS_FILE_ID に、Drive にアップロードしたテンプレート（.xls）のファイルIDを設定してください。');
-    }
-    templateId = convertToSpreadsheet_(xlsId, 'SVレポート_テンプレート', sys.getId());
-    p.setProperty('TEMPLATE_SPREADSHEET_ID', templateId);
-  }
-
-  var dbId = p.getProperty('DB_SPREADSHEET_ID');
-  var ss;
-  if (dbId) {
-    ss = SpreadsheetApp.openById(dbId);
-  } else {
-    ss = SpreadsheetApp.create('SVレポート_管理DB');
-    DriveApp.getFileById(ss.getId()).moveTo(sys);
-    p.setProperty('DB_SPREADSHEET_ID', ss.getId());
-  }
-  Object.keys(SHEETS).forEach(function (key) { ensureSheet_(ss, key); });
-  ss.getSheets().forEach(function (sh) {
-    var known = Object.keys(SHEETS).some(function (k) { return SHEETS[k] === sh.getName(); });
-    if (!known && sh.getLastRow() === 0 && ss.getSheets().length > 1) ss.deleteSheet(sh);
-  });
-  db_cache_ = ss;
-
-  importMastersFromTemplate_(templateId);
-  Logger.log('セットアップ完了\n管理DB: %s\nテンプレート: %s', ss.getUrl(), SpreadsheetApp.openById(templateId).getUrl());
-}
-
-/**
- * テンプレートの改版時に実行する。
- * TEMPLATE_XLS_FILE_ID を新しいExcelのIDに変更してから実行すると、テンプレートを差し替え、
- * 新しい版の項目を項目マスタに追加して現行版を切り替える。
- * 注意: 項目キーは No から自動採番する。改版で No がずれた場合は、前回・前々回と正しく
- * 紐付くよう、項目マスタの新しい版の「項目キー」を旧版に合わせて修正すること。
- */
-function updateTemplate() {
-  var p = props_();
-  var xlsId = p.getProperty('TEMPLATE_XLS_FILE_ID');
-  if (!xlsId) throw new Error('TEMPLATE_XLS_FILE_ID を設定してください');
-  var templateId = convertToSpreadsheet_(xlsId, 'SVレポート_テンプレート_' + formatDate_(new Date(), 'yyyyMMdd'), systemFolder_().getId());
-  p.setProperty('TEMPLATE_SPREADSHEET_ID', templateId);
-  importMastersFromTemplate_(templateId);
-}
-
-function systemFolder_() {
-  var root = DriveApp.getFolderById(props_().getProperty('ROOT_FOLDER_ID') || DEFAULT_ROOT_FOLDER_ID);
-  return getOrCreateFolder_(root, '_システム');
-}
-
-/** Excel を Google スプレッドシートに変換（既にスプレッドシートならコピー）して新しいファイルIDを返す */
-function convertToSpreadsheet_(fileId, name, parentId) {
-  var src = DriveApp.getFileById(fileId);
-  if (src.getMimeType() === MimeType.GOOGLE_SHEETS) {
-    return src.makeCopy(name, DriveApp.getFolderById(parentId)).getId();
-  }
-  var copied = Drive.Files.copy(
-    { name: name, mimeType: MimeType.GOOGLE_SHEETS, parents: [parentId] },
-    fileId,
-    { supportsAllDrives: true }
-  );
-  return copied.id;
-}
-
-function importMastersFromTemplate_(templateId) {
-  var tpl = SpreadsheetApp.openById(templateId);
-  var sh = tpl.getSheetByName(REPORT_SHEET_NAME) || tpl.getSheets()[0];
-  var values = sh.getRange(1, 1, sh.getLastRow(), 15).getValues();
-  var version = parseVersion(values);
-  if (!version) throw new Error('テンプレートのO1セルから版を読み取れません');
-
-  // 項目マスタ（その版が未登録の場合のみ追加）
-  var exists = readObjects_('items').some(function (r) { return String(r['版']) === version; });
-  if (!exists) {
-    appendObjects_('items', parseTemplateItems(values).map(function (i) {
-      return {
-        '版': version, '項目キー': i.key, 'No': String(i.no), '種別': i.type, '区分': i.category, '項目': i.text,
-        '減点L': i.penalties.L === null ? '' : i.penalties.L,
-        '減点M': i.penalties.M === null ? '' : i.penalties.M,
-        '減点H': i.penalties.H === null ? '' : i.penalties.H,
-        '出力行': i.row, '対象外業態': guessExcludedBusinesses(i.text).join(','), '有効': true
-      };
-    }));
-  }
-  props_().setProperty('CURRENT_ITEM_VERSION', version);
-
-  // 校舎マスタ（空の場合のみテンプレートの校舎一覧から作成）
-  var schoolSheet = tpl.getSheetByName(SCHOOL_LIST_SHEET_NAME);
-  if (schoolSheet && readObjects_('schools').length === 0) {
-    var list = parseSchoolList(schoolSheet.getDataRange().getValues());
-    appendObjects_('schools', list.map(function (s) {
-      return {
-        '校舎ID': s.id, '業態': s.business, '地域': s.region, '校舎名': s.name, '経営': s.management,
-        '会社': s.company, '開校日': s.openDate, '備考': s.remarks, '有効': true
-      };
-    }));
-  }
-}
-
-// ===== Import.gs =====
-/**
- * 過去データの取込（スクリプトエディタから手動実行）。
- *
- * スクリプトプロパティ IMPORT_FOLDER_ID のフォルダ（サブフォルダ含む）にある過去のSVレポート
- * （.xls / .xlsx / Google スプレッドシート）を読み取り、登録履歴・明細に「取込」として登録する。
- * - 校舎ID（E2）と実施日（G2）から年度・実施回を判定。同じ実施回が登録済みならスキップ
- * - 項目は項目文で現行の項目マスタと照合（版が違っても文言が同じなら紐付く）
- * - L列（今回の適用減点）と K列（連続指摘回数）をそのまま取り込む
- * - 実行時間の上限（6分）に近づいたら中断する。未処理が残った場合は再実行すると続きから処理する
- * 結果は管理DBの「取込ログ」シートに記録される。
- */
-function importPastReports() {
-  var folderId = props_().getProperty('IMPORT_FOLDER_ID');
-  if (!folderId) throw new Error('スクリプトプロパティ IMPORT_FOLDER_ID に取込元フォルダのIDを設定してください');
-  var started = Date.now();
-  var done = processedImportFileIds_();
-  var master = getItems_();
-  var schools = {};
-  readObjects_('schools').forEach(function (r) {
-    schools[String(r['校舎ID'])] = { id: String(r['校舎ID']), name: String(r['校舎名']), business: String(r['業態']) };
-  });
-  var workFolder = getOrCreateFolder_(systemFolder_(), '_取込作業');
-  var count = { ok: 0, skip: 0, error: 0, remaining: 0 };
-
-  listSpreadsheetFiles_(DriveApp.getFolderById(folderId)).forEach(function (file) {
-    if (done[file.getId()]) return;
-    if (Date.now() - started > 4.5 * 60 * 1000) {
-      count.remaining++;
-      return;
-    }
-    try {
-      var res = importOne_(file, master, schools, workFolder);
-      logImport_(file.getId(), file.getName(), res.status, res.reportId, res.message);
-      count[res.status === 'OK' ? 'ok' : 'skip']++;
-    } catch (e) {
-      logImport_(file.getId(), file.getName(), 'エラー', '', e.message);
-      count.error++;
-    }
-  });
-  Logger.log('取込: 成功 %s / スキップ %s / エラー %s / 未処理 %s', count.ok, count.skip, count.error, count.remaining);
-  if (count.remaining) Logger.log('未処理のファイルがあります。importPastReports() を再実行してください。');
-}
-
-var IMPORTABLE_MIME_TYPES = [
-  'application/vnd.google-apps.spreadsheet',
-  'application/vnd.ms-excel',
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-];
-
-function listSpreadsheetFiles_(folder) {
-  var result = [];
-  var files = folder.getFiles();
-  while (files.hasNext()) {
-    var f = files.next();
-    if (IMPORTABLE_MIME_TYPES.indexOf(f.getMimeType()) >= 0) result.push(f);
-  }
-  var subs = folder.getFolders();
-  while (subs.hasNext()) result = result.concat(listSpreadsheetFiles_(subs.next()));
-  return result;
-}
-
-function toDateString_(v) {
-  if (v instanceof Date) return formatDate_(v);
-  var m = /(\d{4})[\/\-.年](\d{1,2})[\/\-.月](\d{1,2})/.exec(String(v || ''));
-  return m ? m[1] + '-' + ('0' + m[2]).slice(-2) + '-' + ('0' + m[3]).slice(-2) : '';
-}
-
-function importOne_(file, master, schools, workFolder) {
-  var tempId = null;
-  var ssId = file.getId();
-  if (file.getMimeType() !== MimeType.GOOGLE_SHEETS) {
-    tempId = convertToSpreadsheet_(file.getId(), '取込_' + file.getName(), workFolder.getId());
-    ssId = tempId;
-  }
-  try {
-    var ss = SpreadsheetApp.openById(ssId);
-    var sh = ss.getSheetByName(REPORT_SHEET_NAME) || ss.getSheets()[0];
-    var parsed = parseReportSheet(sh.getRange(1, 1, sh.getLastRow(), 15).getValues());
-    var h = parsed.header;
-    if (!h.schoolId) throw new Error('校舎ID（E2）が空です');
-    var dateStr = toDateString_(h.date);
-    if (!dateStr) throw new Error('実施日（G2）が読み取れません');
-
-    var period = periodOf(dateStr);
-    var school = schools[h.schoolId] || { id: h.schoolId, name: h.schoolName, business: h.business };
-    var reportId = reportIdOf(period.year, period.round, school.id);
-    if (findReport_(reportId)) return { status: 'スキップ', reportId: reportId, message: '登録済み' };
-
-    // 項目の照合（全文一致 → 先頭一致）
-    var byText = {};
-    master.items.forEach(function (i) { byText[normalizeItemText(i.text)] = i; });
-    var mapped = {};
-    var unmatched = [];
-    parsed.items.forEach(function (pi) {
-      var norm = normalizeItemText(pi.text);
-      var mi = byText[norm] || master.items.filter(function (i) {
-        var n = normalizeItemText(i.text);
-        return n.indexOf(norm.slice(0, 12)) === 0 || norm.indexOf(n.slice(0, 12)) === 0;
-      })[0];
-      if (!mi || mapped[mi.key]) {
-        if (pi.applied < 0) unmatched.push('No.' + pi.no + '(' + pi.applied + ')');
-        return;
-      }
-      mapped[mi.key] = {
-        level: inferLevel(pi, pi.applied, pi.count),
-        base: pi.applied < 0 ? pi.applied / Math.min(pi.count || 1, MAX_MULTIPLIER) : 0,
-        count: pi.count, applied: pi.applied, na: /^対象外/.test(pi.note), note: pi.note
-      };
-    });
-
-    var total = parsed.items.reduce(function (s, pi) { return s + (pi.applied < 0 ? pi.applied : 0); }, 0);
-    var now = new Date();
-    saveReport_({
-      'レポートID': reportId, '年度': period.year, '実施回': period.round, '校舎ID': school.id,
-      '校舎名': school.name, '業態': school.business, '実施日': dateStr, 'AM': h.am, 'SV': h.sv,
-      '現金': h.cash, '通帳残': h.bank, 'TMS金額': h.tms, '減点合計': total, '点数': 100 + total,
-      'テンプレート版': h.version, 'ファイルID': file.getId(), 'ファイルURL': file.getUrl(), '版数': 1,
-      '登録者': currentUserEmail_(), '登録日時': now, '更新日時': now, '区分': '取込', '送信ID': ''
-    }, master.items.map(function (i) {
-      var l = mapped[i.key] || { level: '', base: 0, count: 0, applied: 0, na: false, note: '' };
-      return {
-        'レポートID': reportId, '校舎ID': school.id, '年度': period.year, '実施回': period.round,
-        '項目キー': i.key, 'レベル': l.level, '基本減点': l.base, '連続回数': l.count,
-        '適用減点': l.applied, '対象外': l.na, '備考': l.note
-      };
-    }));
-    return {
-      status: 'OK', reportId: reportId,
-      message: unmatched.length ? '項目マスタと照合できない減点あり（合計点には含む）: ' + unmatched.join(' ') : ''
-    };
-  } finally {
-    if (tempId) DriveApp.getFileById(tempId).setTrashed(true);
-  }
 }
