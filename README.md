@@ -15,6 +15,7 @@ SVレポート（`SVレポート_2026.10ver.xls`）の入力フォーム。HTML�
 
 | ファイル | 内容 |
 |---|---|
+| `src/Config.gs` | 設定（保存先フォルダID・シート名・スクリプトプロパティの読み込み） |
 | `src/Code.gs` | ウェブアプリ（doGet）と画面から呼ばれるAPI |
 | `src/Domain.gs` | 業務ルール（実施回判定・連続指摘・減点計算）。画面にも同じコードを埋め込んで使う |
 | `src/Parser.gs` | テンプレート／過去レポートの解析 |
@@ -31,7 +32,7 @@ SVレポート（`SVレポート_2026.10ver.xls`）の入力フォーム。HTML�
 
 画面操作つきの詳しい手順は **[docs/導入手順.md](docs/導入手順.md)** を参照。以下は概要。
 
-1. **GASプロジェクトを作成**し、`src/` の内容を配置する（[clasp](https://github.com/google/clasp) を使う場合は `.clasp.json.example` を `.clasp.json` にコピーして scriptId を設定し `clasp push`）。
+1. **GASプロジェクトを作成**し、`dist/SVレポート登録.gs`（全 .gs を1つにまとめたもの）と `src/` の HTML 3ファイル・`appsscript.json` を配置する（[clasp](https://github.com/google/clasp) を使う場合は `.clasp.json.example` を `.clasp.json` にコピーして scriptId を設定し `clasp push`）。
    エディタで手作業で作る場合は `appsscript.json` も反映すること（「プロジェクトの設定」→「appsscript.json をエディタで表示する」）。
 2. **テンプレートExcelをDriveにアップロード**し、ファイルIDを控える。
 3. スクリプトエディタ「プロジェクトの設定」→「スクリプト プロパティ」に設定:
