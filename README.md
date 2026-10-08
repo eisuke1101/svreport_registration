@@ -70,7 +70,10 @@ SVレポート（`SVレポート_2026.10ver.xls`）の入力フォーム。HTML�
 ## 開発
 
 ```
-npm test
+npm run check   # 実装後のエラーチェック一式（1ファイル版の生成・構文・名前の重複・エントリポイント・全テスト）
+npm test        # テストのみ
 ```
 
-`Domain.gs` / `Parser.gs` / `Repository.gs` / `Code.gs` の登録処理を、Node 上でスプレッドシートのモックを使ってテストする。
+変更後は必ず `npm run check` を実行し「結果: すべてOK」を確認してからコミットする。
+
+テストは、単体テストに加えて `test/gasenv.js`（SpreadsheetApp・DriveApp 等のモック）上で **貼り付け用の1ファイル版そのもの** を動かし、setup → 画面初期表示 → 登録 → 出力シートのセル内容 → 上書き → 過去データ取込 を通しで確認する。

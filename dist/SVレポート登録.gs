@@ -1213,3 +1213,5 @@ function validatePayload_(p) {
   });
   if (errors.length) throw new Error('未入力または不正な項目があります: ' + errors.join('、'));
 }
+
+// ===== ファイル終端（全1217行）: この行まで貼り付けられていればOK =====

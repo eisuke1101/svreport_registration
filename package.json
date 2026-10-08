@@ -3,6 +3,7 @@
   "private": true,
   "scripts": {
     "test": "node --test test/*.test.js",
-    "bundle": "node scripts/bundle.js"
+    "bundle": "node scripts/bundle.js",
+    "check": "node scripts/check.js"
   }
 }
