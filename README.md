@@ -24,6 +24,7 @@ SVレポート（`SVレポート_2026.10ver.xls`）の入力フォーム。HTML�
 | `src/Setup.gs` | 初期設定 `setup()`、テンプレート改版 `updateTemplate()` |
 | `src/Import.gs` | 過去データ取込 `importPastReports()` |
 | `src/index.html` `css.html` `js.html` | 入力画面 |
+| `dist/SVレポート登録.gs` | `src/*.gs` を1ファイルにまとめたもの（GASエディタへの貼り付け用。`npm run bundle` で生成） |
 | `test/` | Node でのテスト（`npm test`） |
 
 ## 導入手順
