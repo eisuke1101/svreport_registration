@@ -1,0 +1,627 @@
+<script>
+/* ===== SVレポート登録 画面ロジック =====
+ * - 計算は Domain.gs と同じ関数（sharedSource() で埋め込み）を使用。登録時はサーバで再計算する
+ * - 入力内容はこの端末の IndexedDB に自動保存（下書き）。オフライン時の登録は保留し、復帰後に自動送信
+ */
+const $ = (id) => document.getElementById(id);
+const S = {
+  boot: null, ctx: null, inputs: {}, photos: [], savedPhotos: [], removedPhotoIds: [],
+  overwrite: false, promptedFor: null, submissionId: null, sending: false
+};
+
+/* ---------- IndexedDB（キー・バリュー） ---------- */
+const idb = (() => {
+  let dbp = null;
+  const open = () => dbp || (dbp = new Promise((resolve, reject) => {
+    const req = indexedDB.open('svreport', 1);
+    req.onupgradeneeded = () => req.result.createObjectStore('kv');
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  }));
+  const tx = async (mode, fn) => {
+    const db = await open();
+    return new Promise((resolve, reject) => {
+      const t = db.transaction('kv', mode);
+      const r = fn(t.objectStore('kv'));
+      t.oncomplete = () => resolve(r && r.result);
+      t.onerror = () => reject(t.error);
+    });
+  };
+  return {
+    get: (k) => tx('readonly', (s) => s.get(k)).catch(() => undefined),
+    set: (k, v) => tx('readwrite', (s) => s.put(v, k)),
+    del: (k) => tx('readwrite', (s) => s.delete(k))
+  };
+})();
+
+/* ---------- サーバ呼び出し ---------- */
+function call(fn, ...args) {
+  return new Promise((resolve, reject) => {
+    google.script.run.withSuccessHandler(resolve).withFailureHandler(reject)[fn](...args);
+  });
+}
+function errMsg(e) { return String((e && e.message) || e); }
+function isNetworkError(e) {
+  return !navigator.onLine || /NetworkError|network|HTTP 0|Failed to fetch|timed? ?out|接続/i.test(errMsg(e));
+}
+function uuid() {
+  return (crypto.randomUUID && crypto.randomUUID()) || (Date.now().toString(36) + Math.random().toString(36).slice(2));
+}
+
+/* ---------- 表示ユーティリティ ---------- */
+function showBanner(html, isError) {
+  const b = $('banner');
+  b.innerHTML = html;
+  b.classList.toggle('error', !!isError);
+  b.classList.toggle('hidden', !html);
+}
+function showLoading(text) { $('loadingText').textContent = text || '処理中…'; $('loading').classList.remove('hidden'); }
+function hideLoading() { $('loading').classList.add('hidden'); }
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function updateNet() {
+  const on = navigator.onLine;
+  $('netStatus').textContent = on ? 'オンライン' : 'オフライン';
+  $('netStatus').className = 'badge ' + (on ? 'online' : 'offline');
+}
+function today() {
+  const d = new Date();
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+function levelLabel(level) { return level === LEVEL_IMPORTANT ? '該当' : level; }
+
+/* ---------- 初期化 ---------- */
+async function init() {
+  updateNet();
+  window.addEventListener('online', () => { updateNet(); processPending(); });
+  window.addEventListener('offline', updateNet);
+
+  let boot;
+  try {
+    boot = await call('apiGetBootstrap');
+    await idb.set('boot', boot);
+  } catch (e) {
+    boot = await idb.get('boot');
+    if (!boot) { showBanner('初期データを取得できません: ' + esc(errMsg(e)), true); return; }
+    showBanner('サーバに接続できないため、この端末に保存済みのマスタで起動しました。');
+  }
+  S.boot = boot;
+  $('version').textContent = boot.version + 'ver.';
+  $('schoolList').innerHTML = boot.schools.map((s) => `<option value="${esc(schoolLabel(s))}">`).join('');
+  $('amList').innerHTML = boot.amNames.map((n) => `<option value="${esc(n)}">`).join('');
+  $('svList').innerHTML = boot.svNames.map((n) => `<option value="${esc(n)}">`).join('');
+  $('date').value = today();
+  updatePeriod();
+
+  bindEvents();
+  const draft = await idb.get('draft:current');
+  if (draft) {
+    restoreDraft(draft);
+    showBanner(`入力途中のデータ（${esc(draft.savedAt)} 保存）を復元しました。不要な場合は「下書きを破棄」を押してください。`);
+    if (navigator.onLine) loadContext({ silent: true });
+  }
+  renderPending();
+  processPending();
+}
+
+function schoolLabel(s) { return `${s.id} ${s.name}（${s.business}）`; }
+function findSchool() {
+  const v = $('school').value.trim();
+  if (!v || !S.boot) return null;
+  const id = (/^(\d+)/.exec(v) || [])[1];
+  return S.boot.schools.find((s) => (id && s.id === id) || s.name === v) || null;
+}
+function updatePeriod() {
+  try {
+    const p = periodOf($('date').value);
+    $('period').textContent = `${p.year}年度 第${p.round}回`;
+    return p;
+  } catch (e) {
+    $('period').textContent = '-';
+    return null;
+  }
+}
+
+function bindEvents() {
+  $('school').addEventListener('change', () => loadContext());
+  $('school').addEventListener('input', () => {
+    const s = findSchool();
+    if (s && $('school').value === schoolLabel(s)) loadContext(); // 候補リストから選んだ時点で読み込む
+  });
+  $('date').addEventListener('change', () => { updatePeriod(); loadContext(); });
+  ['am', 'sv', 'cash', 'bank', 'tms'].forEach((id) => $(id).addEventListener('input', () => { updateCashTotal(); saveDraftSoon(); }));
+  $('onlyPrev').addEventListener('change', applyFilter);
+  $('submit').addEventListener('click', submit);
+  $('clearDraft').addEventListener('click', async () => {
+    if (!confirm('入力中の内容を破棄しますか？')) return;
+    await idb.del('draft:current');
+    resetForm(false);
+  });
+  $('doneNext').addEventListener('click', () => $('done').classList.add('hidden'));
+  $('sendPending').addEventListener('click', processPending);
+
+  const body = $('itemsBody');
+  body.addEventListener('click', (ev) => {
+    const btn = ev.target.closest('.levels button');
+    if (!btn) return;
+    const key = btn.closest('tr').dataset.key;
+    input(key).level = btn.dataset.level;
+    recalc();
+    saveDraftSoon();
+  });
+  body.addEventListener('change', (ev) => {
+    if (ev.target.classList.contains('na')) {
+      input(ev.target.closest('tr').dataset.key).na = ev.target.checked;
+      recalc();
+      saveDraftSoon();
+    }
+  });
+  body.addEventListener('input', (ev) => {
+    if (ev.target.classList.contains('note')) {
+      input(ev.target.closest('tr').dataset.key).note = ev.target.value;
+      saveDraftSoon();
+    }
+  });
+  document.addEventListener('change', (ev) => {
+    if (ev.target.matches('input[type=file][data-photo-key]')) addPhotos(ev.target);
+  });
+  document.addEventListener('click', (ev) => {
+    const rm = ev.target.closest('[data-remove-photo]');
+    if (rm) removePhoto(rm.dataset.removePhoto, rm.dataset.saved === '1');
+  });
+}
+
+function input(key) { return S.inputs[key] || (S.inputs[key] = { level: '', na: false, note: '' }); }
+
+/* ---------- 校舎・実施日の選択 ---------- */
+async function loadContext(opts) {
+  opts = opts || {};
+  const school = findSchool();
+  const p = updatePeriod();
+  if (!school || !p) {
+    $('itemsCard').classList.add('hidden');
+    $('bottombar').classList.add('hidden');
+    $('contextInfo').textContent = '';
+    return;
+  }
+  const reportId = reportIdOf(p.year, p.round, school.id);
+  // 同じ校舎・実施回の再選択（フォーカス移動による change 等）では再取得しない
+  if (!opts.silent && S.ctx && S.ctx.reportId === reportId && !S.ctx.offline) return;
+  const cacheKey = 'ctx:' + reportId;
+  let ctx;
+  if (!opts.silent) showLoading('前回・前々回を取得中…');
+  try {
+    ctx = await call('apiGetContext', school.id, $('date').value);
+    await idb.set(cacheKey, ctx);
+  } catch (e) {
+    if (!isNetworkError(e)) {
+      hideLoading();
+      showBanner('取得に失敗しました: ' + esc(errMsg(e)), true);
+      return;
+    }
+    ctx = (await idb.get(cacheKey)) || {
+      reportId, year: p.year, round: p.round, school, existing: null, prev: null, prev2: null, laterReports: [], offline: true
+    };
+    showBanner(ctx.offline
+      ? 'オフラインのため前回・前々回を取得できません。連続指摘・減点は登録時にサーバで再計算されます。'
+      : 'オフラインのため、この端末に保存済みの前回・前々回を表示しています。');
+  } finally {
+    hideLoading();
+  }
+
+  if (S.ctx && S.ctx.reportId !== ctx.reportId) {
+    // 別の校舎・実施回に切り替えた：入力は引き継ぐが、登録済み写真・上書き状態は前のレポートのものなので破棄
+    Object.assign(S, { savedPhotos: [], removedPhotoIds: [], overwrite: false, submissionId: null });
+  }
+  S.ctx = ctx;
+  if (ctx.existing && S.promptedFor !== ctx.reportId) {
+    const ex = ctx.existing;
+    if (confirm(`${school.name} の ${ctx.year}年度第${ctx.round}回 は登録済みです（${ex.updatedAt} 更新、${ex.score}点）。\n登録内容を読み込んで修正しますか？\n\n［キャンセル］入力中の内容を残します（登録時に上書きの確認があります）`)) {
+      loadExisting(ex);
+    }
+  }
+  S.promptedFor = ctx.reportId;
+  if (ctx.laterReports && ctx.laterReports.length) {
+    showBanner(`この校舎は後の実施回（${esc(ctx.laterReports.join('、'))}）が登録済みです。今回の内容は後の回の連続指摘回数には反映されません。`);
+  }
+  renderContextInfo();
+  renderItems();
+  saveDraftSoon();
+}
+
+function loadExisting(ex) {
+  S.inputs = {};
+  Object.keys(ex.lines || {}).forEach((key) => {
+    const l = ex.lines[key];
+    const item = S.boot.items.find((i) => i.key === key);
+    S.inputs[key] = { level: l.level, na: l.na && !(item && isExcludedFor(item, S.ctx ? S.ctx.school.business : '')), note: l.note };
+  });
+  $('am').value = ex.am || $('am').value;
+  $('sv').value = ex.sv || $('sv').value;
+  $('cash').value = ex.cash;
+  $('bank').value = ex.bank;
+  $('tms').value = ex.tms;
+  S.savedPhotos = ex.photos || [];
+  S.removedPhotoIds = [];
+  S.photos = [];
+  S.overwrite = true;
+  updateCashTotal();
+}
+
+function renderContextInfo() {
+  const c = S.ctx;
+  const fmt = (r, label) => r ? `${label}: ${r.year}年度第${r.round}回（${r.date}）${r.score}点` : `${label}: なし`;
+  $('contextInfo').innerHTML = [
+    esc(`業態: ${c.school.business}`),
+    esc(fmt(c.prev, '前回')),
+    esc(fmt(c.prev2, '前々回')),
+    c.existing ? `<b>登録済み（版${c.existing.revision}、${esc(c.existing.updatedAt)}）</b> <a href="${esc(c.existing.url)}" target="_blank">開く</a>` : '未登録'
+  ].join('　／　');
+  $('scorePrev').textContent = c.prev ? c.prev.score : '-';
+  $('scorePrev2').textContent = c.prev2 ? c.prev2.score : '-';
+}
+
+/* ---------- 項目一覧 ---------- */
+function histCell(rep, key) {
+  if (!rep) return '<span class="hist muted">-</span>';
+  const l = rep.lines[key];
+  if (!l) return '<span class="hist muted">-</span>';
+  if (l.na) return '<span class="hist muted">対象外</span>';
+  if (l.applied < 0) return `<span class="hist neg">${l.applied}</span><br><span class="muted">${esc(levelLabel(l.level))}${l.count >= 2 ? ' 連' + l.count : ''}</span>`;
+  return '<span class="hist muted">0</span>';
+}
+
+function renderItems() {
+  const c = S.ctx;
+  const business = c.school.business;
+  let category = null;
+  const rows = [];
+  S.boot.items.forEach((item) => {
+    if (item.category !== category) {
+      category = item.category;
+      rows.push(`<tr class="category"><td colspan="9">${esc(category)}</td></tr>`);
+    }
+    const excluded = isExcludedFor(item, business);
+    const lv = levelsOf(item);
+    const none = `<button type="button" class="none" data-level="">なし</button>`;
+    const buttons = item.type === '重要'
+      ? [none].concat(lv.map((x) => `<button type="button" data-level="${x.level}">該当 ${x.penalty}</button>`))
+      : [none].concat(['L', 'M', 'H'].map((L) => {
+          const x = lv.find((y) => y.level === L);
+          return x ? `<button type="button" data-level="${L}">${L} ${x.penalty}</button>`
+            : `<button type="button" disabled title="選択不可">${L} *</button>`;
+        }));
+    const prevHit = c.prev && c.prev.lines[item.key] && c.prev.lines[item.key].applied < 0;
+    const prev2Hit = c.prev2 && c.prev2.lines[item.key] && c.prev2.lines[item.key].applied < 0;
+    rows.push(`<tr data-key="${item.key}" data-prevhit="${prevHit || prev2Hit ? 1 : 0}" class="${prevHit ? 'prev-hit' : ''}">
+      <td class="c-no">${esc(item.no)}</td>
+      <td class="c-text">${esc(item.text)}</td>
+      <td class="c-hist">${histCell(c.prev2, item.key)}</td>
+      <td class="c-hist">${histCell(c.prev, item.key)}</td>
+      <td class="c-level"><div class="levels">${buttons.join('')}</div>${excluded ? '<span class="muted">対象外（業態）</span>' : ''}</td>
+      <td class="c-na"><input type="checkbox" class="na" ${excluded ? 'checked disabled' : ''}></td>
+      <td class="c-applied"><span class="applied"></span><span class="count"></span></td>
+      <td class="c-note"><textarea class="note" rows="1"></textarea></td>
+      <td class="c-photo"><input type="file" accept="image/*" multiple data-photo-key="${item.key}"><div class="thumbs" data-thumbs-key="${item.key}"></div></td>
+    </tr>`);
+  });
+  $('itemsBody').innerHTML = rows.join('');
+  // 入力値を反映
+  $('itemsBody').querySelectorAll('tr[data-key]').forEach((tr) => {
+    const inp = S.inputs[tr.dataset.key];
+    if (!inp) return;
+    tr.querySelector('textarea.note').value = inp.note || '';
+    const na = tr.querySelector('input.na');
+    if (!na.disabled) na.checked = !!inp.na;
+  });
+  $('itemsCard').classList.remove('hidden');
+  $('bottombar').classList.remove('hidden');
+  renderAllThumbs();
+  applyFilter();
+  recalc();
+}
+
+function recalc() {
+  if (!S.ctx) return null;
+  const prevLines = S.ctx.prev ? S.ctx.prev.lines : {};
+  let result;
+  try {
+    result = computeReport(S.boot.items, S.inputs, prevLines, S.ctx.school.business);
+  } catch (e) {
+    showBanner(esc(errMsg(e)), true);
+    return null;
+  }
+  result.lines.forEach((l) => {
+    const tr = $('itemsBody').querySelector(`tr[data-key="${l.key}"]`);
+    if (!tr) return;
+    const level = l.na ? null : (S.inputs[l.key] && S.inputs[l.key].level) || '';
+    tr.querySelectorAll('.levels button[data-level]').forEach((b) => {
+      b.classList.toggle('sel', !l.na && b.dataset.level === level);
+      b.disabled = l.na;
+    });
+    tr.querySelector('.applied').textContent = l.applied < 0 ? l.applied : '';
+    tr.querySelector('.count').textContent = l.count >= 2 ? `連続${l.count}回目 ×${Math.min(l.count, MAX_MULTIPLIER)}` : '';
+    tr.classList.toggle('hit', l.applied < 0);
+    tr.classList.toggle('na', l.na);
+  });
+  $('scoreNow').textContent = result.score;
+  $('totalNow').textContent = result.total;
+  return result;
+}
+
+function applyFilter() {
+  const only = $('onlyPrev').checked;
+  $('itemsBody').querySelectorAll('tr').forEach((tr) => {
+    if (tr.classList.contains('category')) tr.classList.toggle('hidden', only);
+    else tr.classList.toggle('hidden', only && tr.dataset.prevhit !== '1');
+  });
+}
+
+function updateCashTotal() {
+  const c = $('cash').value, b = $('bank').value;
+  $('cashTotal').textContent = c === '' && b === '' ? '-' : (Number(c || 0) + Number(b || 0)).toLocaleString() + '円';
+}
+
+/* ---------- 写真 ---------- */
+function resizeImage(file, max, quality) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, max / Math.max(img.width, img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL('image/jpeg', quality));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('画像を読み込めません: ' + file.name)); };
+    img.src = url;
+  });
+}
+
+async function addPhotos(inputEl) {
+  const key = inputEl.dataset.photoKey;
+  const item = S.boot.items.find((i) => i.key === key);
+  try {
+    for (const f of Array.from(inputEl.files)) {
+      const dataUrl = await resizeImage(f, 1600, 0.8);
+      S.photos.push({ id: uuid(), itemKey: key, itemNo: item ? String(item.no) : '', name: f.name.replace(/\.[^.]+$/, '') + '.jpg', dataUrl });
+    }
+  } catch (e) {
+    showBanner(esc(errMsg(e)), true);
+  }
+  inputEl.value = '';
+  renderThumbs(key);
+  saveDraftSoon();
+}
+
+function removePhoto(id, saved) {
+  let key;
+  if (saved) {
+    const p = S.savedPhotos.find((x) => x.fileId === id);
+    if (!p || !confirm('登録済みの写真を削除します（登録時に反映）。よろしいですか？')) return;
+    key = p.itemKey;
+    S.savedPhotos = S.savedPhotos.filter((x) => x.fileId !== id);
+    S.removedPhotoIds.push(id);
+  } else {
+    const p = S.photos.find((x) => x.id === id);
+    if (!p) return;
+    key = p.itemKey;
+    S.photos = S.photos.filter((x) => x.id !== id);
+  }
+  renderThumbs(key);
+  saveDraftSoon();
+}
+
+function renderThumbs(key) {
+  const box = document.querySelector(`[data-thumbs-key="${key}"]`);
+  if (!box) return;
+  const saved = S.savedPhotos.filter((p) => p.itemKey === key).map((p) =>
+    `<div class="thumb"><a class="saved" href="${esc(p.url)}" target="_blank" title="${esc(p.name)}">保存済</a><button data-remove-photo="${esc(p.fileId)}" data-saved="1">×</button></div>`);
+  const fresh = S.photos.filter((p) => p.itemKey === key).map((p) =>
+    `<div class="thumb"><img src="${p.dataUrl}" title="${esc(p.name)}"><button data-remove-photo="${p.id}">×</button></div>`);
+  box.innerHTML = saved.concat(fresh).join('');
+}
+
+function renderAllThumbs() {
+  document.querySelectorAll('[data-thumbs-key]').forEach((el) => renderThumbs(el.dataset.thumbsKey));
+}
+
+/* ---------- 下書き（この端末に自動保存） ---------- */
+let draftTimer = null;
+function saveDraftSoon() {
+  clearTimeout(draftTimer);
+  draftTimer = setTimeout(saveDraft, 800);
+}
+function snapshot() {
+  return {
+    school: $('school').value, date: $('date').value, am: $('am').value, sv: $('sv').value,
+    cash: $('cash').value, bank: $('bank').value, tms: $('tms').value,
+    inputs: S.inputs, photos: S.photos, savedPhotos: S.savedPhotos, removedPhotoIds: S.removedPhotoIds,
+    overwrite: S.overwrite, promptedFor: S.promptedFor, ctx: S.ctx, submissionId: S.submissionId,
+    savedAt: new Date().toLocaleString('ja-JP')
+  };
+}
+async function saveDraft() {
+  if (!$('school').value && !Object.keys(S.inputs).length) return;
+  try {
+    const snap = snapshot();
+    await idb.set('draft:current', snap);
+    $('draftStatus').textContent = '下書き保存 ' + snap.savedAt;
+  } catch (e) {
+    $('draftStatus').textContent = '下書きを保存できません: ' + errMsg(e);
+  }
+}
+function restoreDraft(d) {
+  ['school', 'date', 'am', 'sv', 'cash', 'bank', 'tms'].forEach((id) => { $(id).value = d[id] || ''; });
+  S.inputs = d.inputs || {};
+  S.photos = d.photos || [];
+  S.savedPhotos = d.savedPhotos || [];
+  S.removedPhotoIds = d.removedPhotoIds || [];
+  S.overwrite = !!d.overwrite;
+  S.promptedFor = d.promptedFor || null;
+  S.submissionId = d.submissionId || null;
+  S.ctx = d.ctx || null;
+  updatePeriod();
+  updateCashTotal();
+  if (S.ctx) { renderContextInfo(); renderItems(); }
+}
+function resetForm(keepPeople) {
+  const am = $('am').value, sv = $('sv').value;
+  ['school', 'cash', 'bank', 'tms', 'am', 'sv'].forEach((id) => { $(id).value = ''; });
+  if (keepPeople) { $('am').value = am; $('sv').value = sv; }
+  Object.assign(S, { ctx: null, inputs: {}, photos: [], savedPhotos: [], removedPhotoIds: [], overwrite: false, promptedFor: null, submissionId: null });
+  $('itemsBody').innerHTML = '';
+  $('itemsCard').classList.add('hidden');
+  $('bottombar').classList.add('hidden');
+  $('contextInfo').textContent = '';
+  $('draftStatus').textContent = '';
+  updateCashTotal();
+  window.scrollTo(0, 0);
+}
+
+/* ---------- 登録 ---------- */
+function buildPayload() {
+  const school = findSchool();
+  return {
+    submissionId: S.submissionId || (S.submissionId = uuid()),
+    schoolId: school ? school.id : '', schoolName: school ? school.name : '',
+    date: $('date').value, am: $('am').value.trim(), sv: $('sv').value.trim(),
+    cash: $('cash').value, bank: $('bank').value, tms: $('tms').value,
+    inputs: S.inputs,
+    photos: S.photos.map((p) => ({ itemKey: p.itemKey, itemNo: p.itemNo, name: p.name, dataUrl: p.dataUrl })),
+    removedPhotoIds: S.removedPhotoIds, overwrite: S.overwrite
+  };
+}
+
+function validate(p) {
+  const errors = [];
+  const mark = (id, bad) => { $(id).classList.toggle('invalid', bad); if (bad) errors.push($(id).closest('label').firstChild.textContent.trim()); };
+  mark('school', !p.schoolId);
+  mark('date', !p.date);
+  mark('am', !p.am);
+  mark('sv', !p.sv);
+  ['cash', 'bank', 'tms'].forEach((id) => mark(id, p[id] === '' || isNaN(Number(p[id]))));
+  return errors;
+}
+
+async function submit() {
+  if (!S.ctx) return;
+  const payload = buildPayload();
+  const errors = validate(payload);
+  if (errors.length) { alert('次の項目を入力してください: ' + errors.join('、')); return; }
+  const result = recalc();
+  if (!result) return;
+  const p = periodOf(payload.date);
+  if (!confirm(`${payload.schoolName}　${p.year}年度 第${p.round}回 を${S.overwrite ? '上書き' : ''}登録します。\n点数: ${result.score}点（減点 ${result.total}）\n写真: ${payload.photos.length}枚\n\nよろしいですか？`)) return;
+  await saveDraft();
+  const draft = snapshot();
+  if (!navigator.onLine) {
+    await enqueue({ payload, draft });
+    await idb.del('draft:current');
+    resetForm(true);
+    showBanner('オフラインのため登録を保留しました。オンラインに戻ると自動で送信します（この画面を開いたままにしてください）。');
+    return;
+  }
+  await send({ payload, draft }, false);
+}
+
+/** @return {boolean} 送信を終えた（成功または取りやめ）か */
+async function send(entry, fromQueue) {
+  const payload = entry.payload;
+  showLoading('登録中…（写真が多い場合は時間がかかります）');
+  try {
+    let res = await call('apiSubmitReport', payload);
+    if (res.status === 'exists') {
+      hideLoading();
+      const ex = res.existing;
+      if (!confirm(`${payload.schoolName} の ${ex.year}年度第${ex.round}回 は既に登録されています（${ex.updatedAt} 更新、${ex.score}点）。\n上書きしますか？`)) {
+        if (fromQueue) await restoreFromQueue(entry);
+        return true;
+      }
+      payload.overwrite = true;
+      showLoading('登録中…');
+      res = await call('apiSubmitReport', payload);
+    }
+    hideLoading();
+    if (fromQueue) {
+      await dequeue(payload.submissionId);
+      showBanner(`保留していた登録を送信しました: ${esc(payload.schoolName)} ${res.score}点 <a href="${esc(res.url)}" target="_blank">開く</a>`
+        + (res.warning ? '<br>' + esc(res.warning) : ''));
+    } else {
+      await idb.del('draft:current');
+      onDone(res, payload);
+    }
+    return true;
+  } catch (e) {
+    hideLoading();
+    if (isNetworkError(e)) {
+      if (!fromQueue) {
+        await enqueue(entry);
+        await idb.del('draft:current');
+        resetForm(true);
+      }
+      showBanner('通信できないため登録を保留しました。オンラインに戻ると自動で送信します。');
+      return false;
+    }
+    if (fromQueue) await restoreFromQueue(entry);
+    showBanner('登録に失敗しました: ' + esc(errMsg(e)), true);
+    return true;
+  }
+}
+
+function onDone(res, payload) {
+  const p = periodOf(payload.date);
+  $('doneText').innerHTML = esc(`${payload.schoolName}　${p.year}年度 第${p.round}回　${res.score}点（減点 ${res.total}）を${res.updated ? '更新' : '登録'}しました。`)
+    + (res.notified ? '<br>通知メールを送信しました。' : '')
+    + (res.warning ? '<br><span style="color:#d93025">' + esc(res.warning) + '</span>' : '');
+  $('doneLink').href = res.url;
+  $('done').classList.remove('hidden');
+  showBanner('');
+  resetForm(true);
+}
+
+/* ---------- 保留中の登録 ---------- */
+async function getQueue() { return (await idb.get('pending')) || []; }
+async function enqueue(entry) {
+  const q = (await getQueue()).filter((e) => e.payload.submissionId !== entry.payload.submissionId);
+  q.push(entry);
+  await idb.set('pending', q);
+  renderPending();
+}
+async function dequeue(submissionId) {
+  await idb.set('pending', (await getQueue()).filter((e) => e.payload.submissionId !== submissionId));
+  renderPending();
+}
+async function restoreFromQueue(entry) {
+  await dequeue(entry.payload.submissionId);
+  const dirty = $('school').value || Object.keys(S.inputs).length;
+  if (dirty && !confirm('保留していた登録が送信できませんでした。入力中の内容を破棄して、保留分を画面に戻しますか？\n［キャンセル］保留分は破棄されます')) return;
+  restoreDraft(entry.draft);
+  await saveDraft();
+}
+async function renderPending() {
+  const q = await getQueue();
+  $('pendingBanner').classList.toggle('hidden', !q.length);
+  $('pendingCount').textContent = q.length;
+  $('pendingNames').textContent = q.map((e) => e.payload.schoolName + ' ' + e.payload.date).join('、');
+}
+async function processPending() {
+  if (S.sending || !navigator.onLine) return;
+  S.sending = true;
+  try {
+    for (const entry of await getQueue()) {
+      const finished = await send(entry, true);
+      if (!finished) break;
+    }
+  } finally {
+    S.sending = false;
+    renderPending();
+  }
+}
+
+init();
+</script>
