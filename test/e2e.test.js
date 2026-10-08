@@ -215,3 +215,22 @@ test('画面HTML: テンプレートを展開した結果のスクリプトが�
   const ids = [...html.matchAll(/\$\('([A-Za-z0-9]+)'\)/g)].map((m) => m[1]);
   ids.forEach((id) => assert.match(html, new RegExp(`id="${id}"`), `画面に id="${id}" がありません`));
 });
+
+test('setup / 取込: Drive API（拡張サービス）が無効なら追加方法を案内するエラー', () => {
+  const env = createEnv({ rootFolderId: ROOT_FOLDER, templateValues, templateFormulas, schoolList });
+  env.props.TEMPLATE_XLS_FILE_ID = 'xls';
+  const driveService = env.g.Drive;
+  delete env.g.Drive;
+  const app = loadApp(env, fs.readFileSync(BUNDLE, 'utf8'));
+  assert.throws(() => app.setup(), /Drive API（拡張サービス）が有効になっていません.*サービス/);
+  // 有効化して再実行すれば完了する（途中で作られた _システム フォルダがあっても重複しない）
+  app.Drive = driveService;
+  app.setup();
+  assert.equal(app.getItems_().items.length, 92);
+  assert.equal(Object.values(env.folders).filter((f) => f.name === '_システム').length, 1);
+  const { env: env2, app: app2 } = boot();
+  delete app2.Drive;
+  env2.props.IMPORT_FOLDER_ID = 'root';
+  assert.throws(() => app2.importPastReports(), /Drive API（拡張サービス）/);
+  assert.equal(app2.readObjects_('importLog').length, 0);
+});

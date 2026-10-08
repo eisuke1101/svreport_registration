@@ -12,6 +12,7 @@
 function importPastReports() {
   var folderId = props_().getProperty('IMPORT_FOLDER_ID');
   if (!folderId) throw new Error('スクリプトプロパティ IMPORT_FOLDER_ID に取込元フォルダのIDを設定してください');
+  requireDriveService_();
   var started = Date.now();
   var done = processedImportFileIds_();
   var master = getItems_();

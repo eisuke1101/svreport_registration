@@ -78,12 +78,21 @@ function convertToSpreadsheet_(fileId, name, parentId) {
   if (src.getMimeType() === MimeType.GOOGLE_SHEETS) {
     return src.makeCopy(name, DriveApp.getFolderById(parentId)).getId();
   }
+  requireDriveService_();
   var copied = Drive.Files.copy(
     { name: name, mimeType: MimeType.GOOGLE_SHEETS, parents: [parentId] },
     fileId,
     { supportsAllDrives: true }
   );
   return copied.id;
+}
+
+/** Excel の変換に使う Drive API（拡張サービス）が有効か確認する */
+function requireDriveService_() {
+  if (typeof Drive === 'undefined') {
+    throw new Error('Drive API（拡張サービス）が有効になっていません。'
+      + 'エディタ左の「サービス」の＋ →「Drive API」を選び、バージョン v3・ID「Drive」のまま「追加」してから再実行してください。');
+  }
 }
 
 function importMastersFromTemplate_(templateId) {
@@ -136,6 +145,7 @@ function importMastersFromTemplate_(templateId) {
 function importPastReports() {
   var folderId = props_().getProperty('IMPORT_FOLDER_ID');
   if (!folderId) throw new Error('スクリプトプロパティ IMPORT_FOLDER_ID に取込元フォルダのIDを設定してください');
+  requireDriveService_();
   var started = Date.now();
   var done = processedImportFileIds_();
   var master = getItems_();
@@ -1214,4 +1224,4 @@ function validatePayload_(p) {
   if (errors.length) throw new Error('未入力または不正な項目があります: ' + errors.join('、'));
 }
 
-// ===== ファイル終端（全1217行）: この行まで貼り付けられていればOK =====
+// ===== ファイル終端（全1227行）: この行まで貼り付けられていればOK =====
