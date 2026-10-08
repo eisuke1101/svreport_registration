@@ -8,6 +8,7 @@ SVレポート（`SVレポート_2026.10ver.xls`）の入力フォーム。HTML�
 - 写真添付（項目ごと／全体）、登録通知メール（固定の送信先1件）
 - 入力内容はブラウザに自動保存。オフライン時の登録は保留し、オンライン復帰時に自動送信
 - 過去データ（既存のExcel）の取込
+- 管理DBのメニューから PDF 出力（未出力を一括／選択した行）。出力先は `{年度}年度/第{回}回/PDF/`、出力後「PDF出力」列に「済」
 
 設計の詳細は [docs/設計提案.md](docs/設計提案.md) を参照。
 
@@ -24,6 +25,7 @@ SVレポート（`SVレポート_2026.10ver.xls`）の入力フォーム。HTML�
 | `src/Notify.gs` | 登録通知メール |
 | `src/Setup.gs` | 初期設定 `setup()`、テンプレート改版 `updateTemplate()` |
 | `src/Import.gs` | 過去データ取込 `importPastReports()` |
+| `src/Pdf.gs` | 管理DBのメニュー（`onDbOpen`）と PDF 出力 |
 | `src/index.html` `css.html` `js.html` | 入力画面 |
 | `dist/SVレポート登録.gs` | `src/*.gs` を1ファイルにまとめたもの（GASエディタへの貼り付け用。`npm run bundle` で生成） |
 | `test/` | Node でのテスト（`npm test`） |

@@ -11,6 +11,7 @@
  *   - テンプレートを Google スプレッドシートに変換（TEMPLATE_SPREADSHEET_ID）
  *   - 管理用スプレッドシートを作成し各シートを用意（DB_SPREADSHEET_ID）
  *   - テンプレートから校舎マスタ・項目マスタを作成（未作成の場合のみ）
+ *   - 管理DBにメニュー「SVレポート」（PDF出力）を追加するトリガーを登録
  */
 function setup() {
   var p = props_();
@@ -45,7 +46,9 @@ function setup() {
   db_cache_ = ss;
 
   importMastersFromTemplate_(templateId);
-  Logger.log('セットアップ完了\n管理DB: %s\nテンプレート: %s', ss.getUrl(), SpreadsheetApp.openById(templateId).getUrl());
+  installDbMenuTrigger_(ss.getId());
+  Logger.log('セットアップ完了\n管理DB: %s\nテンプレート: %s\n管理DBを開き直すとメニュー「SVレポート」が表示されます。',
+    ss.getUrl(), SpreadsheetApp.openById(templateId).getUrl());
 }
 
 /**

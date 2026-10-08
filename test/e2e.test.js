@@ -234,3 +234,162 @@ test('setup / 取込: Drive API（拡張サービス）が無効なら追加方�
   assert.throws(() => app2.importPastReports(), /Drive API（拡張サービス）/);
   assert.equal(app2.readObjects_('importLog').length, 0);
 });
+
+/* ---------- PDF出力（管理DBのメニュー） ---------- */
+
+function pdfFiles(env, year, round) {
+  const folder = folderByPath(env, [`${year}年度`, `第${round}回`, 'PDF']);
+  return Object.values(env.files).filter((f) => f.parents.includes(folder) && !f.trashed);
+}
+function pdfColumn(app) {
+  return Object.fromEntries(app.readObjects_('reports').map((r) => [r['レポートID'], r['PDF出力']]));
+}
+function bootWithReports() {
+  const ctx = boot();
+  const { app } = ctx;
+  app.apiSubmitReport({ ...base, submissionId: 'r3', date: '2026-08-01', inputs: { I01: { level: 'M' } } });
+  app.apiSubmitReport({ ...base, submissionId: 'r4', date: '2026-10-08', inputs: {} });
+  app.apiSubmitReport({ ...base, schoolId: '9001', submissionId: 'a4', date: '2026-11-20', inputs: {} });
+  return ctx;
+}
+
+test('PDF: setup で管理DBにメニュー用トリガーを1つだけ登録し、メニューの関数が存在する', () => {
+  const { env, app } = boot();
+  app.setup();
+  assert.equal(env.triggers.length, 1);
+  assert.deepEqual({ ...env.triggers[0] }, { fn: 'onDbOpen', source: env.props.DB_SPREADSHEET_ID, type: 'open' });
+  app.onDbOpen();
+  assert.equal(env.ui.menu.name, 'SVレポート');
+  assert.equal(env.ui.menu.items.length, 2);
+  env.ui.menu.items.forEach((i) => assert.equal(typeof app[i.fn], 'function', i.fn));
+});
+
+test('PDF一括: 空欄の行だけを 年度/回/PDF に出力し「済」を記入、2回目は対象なし', () => {
+  const { env, app } = bootWithReports();
+  app.menuExportPendingPdfs();
+  assert.match(env.ui.alerts[0].msg, /空欄の 3 件/);
+  assert.match(env.ui.alerts[1].msg, /出力: 3 件/);
+  const p4 = pdfFiles(env, 2026, 4).map((f) => f.name).sort();
+  assert.deepEqual(p4, ['SVレポート_2026年度第4回_2351_山口宇部校_20261008.pdf', 'SVレポート_2026年度第4回_9001_足立北千住校_20261120.pdf']);
+  assert.deepEqual(pdfFiles(env, 2026, 3).map((f) => f.name), ['SVレポート_2026年度第3回_2351_山口宇部校_20260801.pdf']);
+  assert.ok(pdfFiles(env, 2026, 4).every((f) => f.mime === 'application/pdf'));
+  // チェック項目シートの印刷範囲を A4縦・1ページで
+  const f = env.fetches[0];
+  const report = env.spreadsheets[f.id];
+  assert.equal(f.q.gid, String(report.sheets.find((s) => s.name === 'チェック項目').gid));
+  assert.equal(f.q.range, 'A1:O108');
+  assert.equal(f.q.format, 'pdf');
+  assert.equal(f.q.size, 'A4');
+  assert.equal(f.q.portrait, 'true');
+  assert.equal(f.q.scale, '4');
+  assert.deepEqual(Object.values(pdfColumn(app)), ['済', '済', '済']);
+  assert.equal(env.spreadsheets[env.props.DB_SPREADSHEET_ID].sheets.find((s) => s.name === '登録履歴').data[0][23], 'PDF出力');
+  // 2回目
+  app.menuExportPendingPdfs();
+  assert.match(env.ui.alerts[2].msg, /空欄の行はありません/);
+  assert.equal(env.fetches.length, 3);
+});
+
+test('PDF一括: キャンセルしたら何もしない', () => {
+  const { env, app } = bootWithReports();
+  env.ui.answer = 'CANCEL';
+  app.menuExportPendingPdfs();
+  assert.equal(env.fetches.length, 0);
+  assert.deepEqual(Object.values(pdfColumn(app)), ['', '', '']);
+});
+
+test('PDF: 再登録（上書き）で「PDF出力」が空欄に戻り、次の一括で出し直して古いPDFを置き換える', () => {
+  const { env, app } = bootWithReports();
+  app.menuExportPendingPdfs();
+  app.apiSubmitReport({ ...base, submissionId: 'r4b', date: '2026-10-08', inputs: { I02: { level: 'L' } }, overwrite: true });
+  assert.equal(pdfColumn(app)['2026-4-2351'], '');
+  assert.equal(pdfColumn(app)['2026-3-2351'], '済');
+  app.menuExportPendingPdfs();
+  assert.match(env.ui.alerts[2].msg, /空欄の 1 件/);
+  assert.equal(pdfFiles(env, 2026, 4).length, 2); // 同名は1つだけ（古いものはゴミ箱）
+  assert.equal(Object.values(env.files).filter((x) => x.name === 'SVレポート_2026年度第4回_2351_山口宇部校_20261008.pdf' && x.trashed).length, 1);
+  assert.equal(pdfColumn(app)['2026-4-2351'], '済');
+});
+
+test('PDF個別: 選択した行だけを出力（出力済みでも出し直す）', () => {
+  const { env, app } = bootWithReports();
+  const dbId = env.props.DB_SPREADSHEET_ID;
+  app.menuExportPendingPdfs();
+  const before = env.fetches.length;
+  env.ui.activeSpreadsheetId = dbId;
+  env.spreadsheets[dbId].active = { sheet: '登録履歴', ranges: [[3, 1]] }; // 3行目 = 2026-4-2351
+  app.menuExportSelectedPdfs();
+  assert.match(env.ui.alerts.at(-2).msg, /1 件をPDFに出力します[\s\S]*2026年度第4回 山口宇部校（出力済→出し直し）/);
+  assert.equal(env.fetches.length, before + 1);
+  assert.equal(pdfFiles(env, 2026, 4).length, 2);
+});
+
+test('PDF個別: 複数範囲・見出し行を含む選択、別シートでの実行', () => {
+  const { env, app } = bootWithReports();
+  const dbId = env.props.DB_SPREADSHEET_ID;
+  env.ui.activeSpreadsheetId = dbId;
+  env.spreadsheets[dbId].active = { sheet: '登録履歴', ranges: [[1, 2], [4, 1]] }; // 見出し+2行目、4行目
+  app.menuExportSelectedPdfs();
+  assert.deepEqual(pdfColumn(app), { '2026-3-2351': '済', '2026-4-2351': '', '2026-4-9001': '済' });
+  env.spreadsheets[dbId].active = { sheet: '明細', ranges: [[2, 1]] };
+  app.menuExportSelectedPdfs();
+  assert.match(env.ui.alerts.at(-1).msg, /「登録履歴」シートで出力したい行を選択/);
+});
+
+test('PDF個別: 選択範囲を取得できないときは行番号・レポートIDの入力で指定できる', () => {
+  const { env, app } = bootWithReports();
+  env.ui.promptText = '2, 2026-4-9001';
+  app.menuExportSelectedPdfs();
+  assert.equal(env.ui.prompts.length, 1);
+  assert.deepEqual(pdfColumn(app), { '2026-3-2351': '済', '2026-4-2351': '', '2026-4-9001': '済' });
+});
+
+test('PDF: エラー時は「PDF出力」を空欄のまま、429 は待って再試行', () => {
+  const { env, app } = bootWithReports();
+  const fileOf = (id) => app.findReport_(id).fileId;
+  env.files[fileOf('2026-3-2351')].trashed = true;
+  env.fetchPlan.push(429, 200); // 1件目（第4回）: 1回目429→再試行で成功
+  env.fetchPlan.push(429, 429, 429, 429); // 2件目: 4回とも429で失敗
+  app.menuExportPendingPdfs();
+  const msg = env.ui.alerts.at(-1).msg;
+  assert.match(msg, /出力: 1 件/);
+  assert.match(msg, /エラー: 2 件/);
+  assert.match(msg, /ゴミ箱/);
+  assert.match(msg, /HTTP 429/);
+  assert.deepEqual(env.sleeps, [5000, 5000, 10000, 15000]);
+  assert.deepEqual(pdfColumn(app), { '2026-3-2351': '', '2026-4-2351': '済', '2026-4-9001': '' });
+});
+
+test('PDF: 時間切れで中断した分は空欄のまま残り、再実行で処理される', () => {
+  const { env, app } = bootWithReports();
+  app.PDF_TIME_LIMIT_MS = -1;
+  app.menuExportPendingPdfs();
+  assert.match(env.ui.alerts.at(-1).msg, /時間切れで未処理: 3 件/);
+  app.PDF_TIME_LIMIT_MS = 5 * 60 * 1000;
+  app.menuExportPendingPdfs();
+  assert.deepEqual(Object.values(pdfColumn(app)), ['済', '済', '済']);
+});
+
+test('PDF: 過去データ取込（Excel）の行も一時変換して出力し、一時ファイルを削除', () => {
+  const { env, app } = boot();
+  env.folders.imp = { id: 'imp', name: '過去分', parent: 'root' };
+  const v = JSON.parse(JSON.stringify(templateValues));
+  v[1][4] = 2351; v[1][6] = new Date(2026, 4, 20);
+  env.files.p1 = { id: 'p1', name: 'SV山口宇部_2026春.xls', mime: 'application/vnd.ms-excel', parents: ['imp'], trashed: false,
+    excelContent: { sheets: [{ name: 'チェック項目', data: v, formulas: {}, maxRows: 1000, maxCols: 26, gid: 777 }] } };
+  env.props.IMPORT_FOLDER_ID = 'imp';
+  app.importPastReports();
+  app.menuExportPendingPdfs();
+  assert.match(env.ui.alerts.at(-1).msg, /出力: 1 件/);
+  assert.deepEqual(pdfFiles(env, 2026, 2).map((f) => f.name), ['SV山口宇部_2026春.pdf']);
+  assert.ok(Object.values(env.files).filter((f) => f.name.startsWith('PDF作業_')).every((f) => f.trashed));
+});
+
+test('PDF: setup を再実行していない古い管理DB（見出しなし）でも見出しを補って出力できる', () => {
+  const { env, app } = bootWithReports();
+  const sh = env.spreadsheets[env.props.DB_SPREADSHEET_ID].sheets.find((s) => s.name === '登録履歴');
+  sh.data[0][23] = '';
+  app.menuExportPendingPdfs();
+  assert.equal(sh.data[0][23], 'PDF出力');
+  assert.deepEqual(Object.values(pdfColumn(app)), ['済', '済', '済']);
+});

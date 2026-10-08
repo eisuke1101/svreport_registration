@@ -66,6 +66,7 @@ function makeRange(sh, r, c, nr, nc) {
       return range;
     },
     getRow: () => r,
+    getNumRows: () => nr,
     setFontWeight: () => range,
     setBackground: () => range,
     setNumberFormat: () => range,
@@ -88,9 +89,10 @@ function makeRange(sh, r, c, nr, nc) {
 }
 
 function makeSheet(ss, name, data) {
-  const sh = { name, data: data || [], formulas: {}, maxRows: 1000, maxCols: 26, ss };
+  const sh = { name, data: data || [], formulas: {}, maxRows: 1000, maxCols: 26, ss, gid: ++idSeq };
   sh.api = strict({
     getName: () => sh.name,
+    getSheetId: () => sh.gid,
     getRange: (a, b, c, d) => {
       if (typeof a === 'string') {
         const m = /^([A-Z]+)(\d+)$/.exec(a);
@@ -131,6 +133,12 @@ function createEnv(opts) {
     ss.api = strict({
       getId: () => id,
       getUrl: () => `https://docs.google.com/spreadsheets/d/${id}`,
+      getActiveSheet: () => (ss.active ? ss.sheets.find((s) => s.name === ss.active.sheet).api : ss.sheets[0].api),
+      getActiveRangeList: () => {
+        if (!ss.active) return null;
+        const sh = ss.sheets.find((s) => s.name === ss.active.sheet);
+        return strict({ getRanges: () => ss.active.ranges.map(([r, n]) => makeRange(sh, r, 1, n, 3)) }, 'RangeList');
+      },
       getSheetByName: (n) => { const s = ss.sheets.find((x) => x.name === n); return s ? s.api : null; },
       getSheets: () => ss.sheets.map((s) => s.api),
       insertSheet: (n) => {
@@ -165,13 +173,14 @@ function createEnv(opts) {
     return strict({
       getId: () => id,
       getName: () => f.name,
+      getFilesByName: (n) => iter(Object.values(files).filter((x) => x.parents.includes(id) && !x.trashed && x.name === n).map((x) => fileApi(x.id))),
       getFoldersByName: (n) => iter(Object.values(folders).filter((x) => x.parent === id && x.name === n).map((x) => folderApi(x.id))),
       getFolders: () => iter(Object.values(folders).filter((x) => x.parent === id).map((x) => folderApi(x.id))),
       getFiles: () => iter(Object.values(files).filter((x) => x.parents.includes(id) && !x.trashed).map((x) => fileApi(x.id))),
       createFolder: (n) => { const nid = newId('folder'); folders[nid] = { id: nid, name: n, parent: id }; return folderApi(nid); },
       createFile: (blob) => {
         const nid = newId('file');
-        files[nid] = { id: nid, name: blob.getName(), mime: blob.getContentType(), parents: [id], trashed: false, bytes: blob.bytes };
+        files[nid] = { id: nid, name: blob.getName(), mime: blob.getContentType(), parents: [id], trashed: false, bytes: blob.bytes, source: blob.source };
         return fileApi(nid);
       }
     }, 'Folder');
@@ -198,6 +207,39 @@ function createEnv(opts) {
   }
 
   const MimeType = { GOOGLE_SHEETS: 'application/vnd.google-apps.spreadsheet' };
+  const triggers = [];
+  const fetches = [];
+  const sleeps = [];
+  const ui = { alerts: [], prompts: [], answer: 'OK', promptText: '' };
+  const fetchPlan = []; // テストで設定する応答コードの予定（空なら 200）
+  function makeBlob(bytes, type, name, source) {
+    const b = { bytes, type, name, source };
+    const api = strict({
+      getName: () => b.name, getContentType: () => b.type, bytes: b.bytes, source: b.source,
+      setName: (n) => { b.name = n; return api; }
+    }, 'Blob');
+    return api;
+  }
+  const Button = { OK: 'OK', CANCEL: 'CANCEL' };
+  const uiApi = strict({
+    ButtonSet: { OK: 'OK', OK_CANCEL: 'OK_CANCEL' },
+    Button,
+    alert: (title, msg, buttons) => { ui.alerts.push({ title, msg, buttons }); return buttons === 'OK_CANCEL' ? ui.answer : 'OK'; },
+    prompt: (title, msg) => {
+      ui.prompts.push({ title, msg });
+      return strict({ getSelectedButton: () => ui.answer, getResponseText: () => ui.promptText }, 'PromptResponse');
+    },
+    createMenu: (name) => {
+      const menu = { name, items: [] };
+      ui.menu = menu;
+      const m = strict({
+        addItem: (label, fn) => { menu.items.push({ label, fn }); return m; },
+        addSeparator: () => m,
+        addToUi: () => {}
+      }, 'Menu');
+      return m;
+    }
+  }, 'Ui');
   const g = {
     MimeType,
     PropertiesService: strict({
@@ -216,7 +258,9 @@ function createEnv(opts) {
         ss.sheets.push(makeSheet(ss, 'シート1'));
         return ss.api;
       },
-      flush: () => {}
+      flush: () => {},
+      getUi: () => uiApi,
+      getActiveSpreadsheet: () => (ui.activeSpreadsheetId ? spreadsheets[ui.activeSpreadsheetId].api : null)
     }, 'SpreadsheetApp'),
     DriveApp: strict({ getFolderById: folderApi, getFileById: fileApi }, 'DriveApp'),
     Drive: strict({
@@ -243,9 +287,40 @@ function createEnv(opts) {
           .replace('HH', p(d.getHours())).replace('mm', p(d.getMinutes())).replace('ss', p(d.getSeconds()));
       },
       base64Decode: (s) => Array.from(Buffer.from(s, 'base64')),
-      newBlob: (bytes, type, name) => strict({ getName: () => name, getContentType: () => type, bytes }, 'Blob')
+      newBlob: (bytes, type, name) => makeBlob(bytes, type, name),
+      sleep: (ms) => { sleeps.push(ms); }
     }, 'Utilities'),
     MailApp: strict({ sendEmail: (m) => { if (!m.to || !m.subject) throw new Error('メール引数不正'); mails.push(m); } }, 'MailApp'),
+    ScriptApp: strict({
+      getProjectTriggers: () => triggers.map((t) => strict({ getHandlerFunction: () => t.fn, getTriggerSourceId: () => t.source }, 'Trigger')),
+      newTrigger: (fn) => {
+        const t = { fn };
+        const b = strict({
+          forSpreadsheet: (idOrSs) => { t.source = typeof idOrSs === 'string' ? idOrSs : idOrSs.getId(); return b; },
+          onOpen: () => { t.type = 'open'; return b; },
+          create: () => { if (!t.source || !t.type) throw new Error('トリガー設定不足'); triggers.push(t); return {}; }
+        }, 'TriggerBuilder');
+        return b;
+      },
+      getOAuthToken: () => 'token'
+    }, 'ScriptApp'),
+    UrlFetchApp: strict({
+      fetch: (url, opts) => {
+        const m = /^https:\/\/docs\.google\.com\/spreadsheets\/d\/([^/]+)\/export\?(.*)$/.exec(url);
+        if (!m) throw new Error('想定外のURL: ' + url);
+        if (!opts || !opts.headers || opts.headers.Authorization !== 'Bearer token') throw new Error('認証ヘッダなし');
+        const q = Object.fromEntries(new URLSearchParams(m[2]));
+        fetches.push({ id: m[1], q });
+        const code = fetchPlan.length ? fetchPlan.shift() : 200;
+        const ss = spreadsheets[m[1]];
+        if (code === 200 && (!ss || files[m[1]].trashed)) throw new Error('存在しないファイルのエクスポート');
+        if (code === 200 && !ss.sheets.some((s) => String(s.gid) === q.gid)) throw new Error('gid 不一致');
+        return strict({
+          getResponseCode: () => code,
+          getBlob: () => makeBlob([37, 80, 68, 70], 'application/pdf', 'export.pdf', m[1])
+        }, 'HTTPResponse');
+      }
+    }, 'UrlFetchApp'),
     LockService: strict({ getScriptLock: () => strict({ tryLock: () => true, releaseLock: () => {} }, 'Lock') }, 'LockService'),
     Session: strict({ getActiveUser: () => strict({ getEmail: () => 'sv@example.com' }, 'User') }, 'Session'),
     Logger: strict({ log: () => {} }, 'Logger')
@@ -261,7 +336,7 @@ function createEnv(opts) {
   excel.sheets.push(makeSheet(excel, '校舎一覧', JSON.parse(JSON.stringify(opts.schoolList))));
   files.xls = { id: 'xls', name: 'SVレポート_2026.10ver.xls', mime: 'application/vnd.ms-excel', parents: ['root'], trashed: false, excelContent: excel };
 
-  return { g, props, files, folders, spreadsheets, mails };
+  return { g, props, files, folders, spreadsheets, mails, triggers, fetches, fetchPlan, sleeps, ui };
 }
 
 /** 貼り付け用の1ファイル（dist）または src/*.gs を、モック環境で読み込む */

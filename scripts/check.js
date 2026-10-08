@@ -45,7 +45,7 @@ if (!failed) ok(`${Object.keys(seen).length} 個の名前に重複なし`);
 console.log('[4] エントリポイント');
 const ctx = vm.createContext({});
 vm.runInContext(bundle, ctx);
-['setup', 'updateTemplate', 'importPastReports', 'doGet', 'include', 'sharedSource',
+['setup', 'updateTemplate', 'importPastReports', 'onDbOpen', 'menuExportPendingPdfs', 'menuExportSelectedPdfs', 'doGet', 'include', 'sharedSource',
   'apiGetBootstrap', 'apiGetContext', 'apiSubmitReport'].forEach((n) => (typeof ctx[n] === 'function' ? ok(n) : ng(`${n} がありません`)));
 const fnLine = bundle.split('\n').findIndex((l) => /^function\s/.test(l));
 /^function setup\(/.test(bundle.split('\n')[fnLine]) ? ok('先頭の関数は setup（エディタの実行プルダウン初期値）') : ng('先頭の関数が setup ではありません');
